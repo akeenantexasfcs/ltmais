@@ -420,9 +420,13 @@ def extract_tables_from_textract(data):
                 table_df = table_df.sort_index(axis=1)
                 tables.append(table_df)
     return tables
-@st.cache_data(ttl=3600)
-def classify_income_statement_with_ai_cached(accounts_json, model, label_list):
-    """Cached version of AI classification to avoid repeated API calls"""
+@st.cache_data(ttl=86400, show_spinner=False)
+def classify_income_statement_with_ai_cached(accounts_hash, accounts_json, model):
+    """
+    Cached version of AI classification to avoid repeated API calls.
+    Uses hash-based cache key for stability (24-hour TTL).
+    The accounts_hash parameter ensures cache hits for identical account lists.
+    """
     session = get_active_session()
     prompt = f"""You are a financial analyst expert in income statement classification.
 Classify each line item into one of these primary categories:
@@ -472,6 +476,7 @@ Return ONLY the JSON array, no other text."""
                 return None
     except Exception:
         return None
+
 def classify_income_statement_with_ai(df, account_column, model, session):
     """AI classification with caching"""
     classifications = {}
@@ -485,8 +490,15 @@ def classify_income_statement_with_ai(df, account_column, model, session):
             })
     if not accounts_list:
         return classifications
-    accounts_json = json.dumps([acc['account'] for acc in accounts_list])
-    ai_results = classify_income_statement_with_ai_cached(accounts_json, model, tuple(accounts_list))
+
+    # Create stable cache key using hash of account names (not indices)
+    account_names = [acc['account'] for acc in accounts_list]
+    accounts_json = json.dumps(account_names)
+    accounts_hash = hashlib.md5(f"{accounts_json}:{model}".encode()).hexdigest()
+
+    # Call cached function with hash-based key
+    ai_results = classify_income_statement_with_ai_cached(accounts_hash, accounts_json, model)
+
     if ai_results:
         for i, account_data in enumerate(accounts_list):
             if i < len(ai_results):
@@ -1699,9 +1711,13 @@ def main():
                         class_df['Confidence'] = class_df.index.map(
                             lambda idx: f"{classifications.get(idx, {}).get('confidence', 0):.0%}"
                         )
-                        # Initialize Remove column - all False by default
-                        # The data_editor will manage the actual state via its key
-                        class_df['Remove'] = False
+                        # Track select-all state for this file
+                        select_all_key = f"select_all_{file_name}"
+                        if select_all_key not in st.session_state:
+                            st.session_state[select_all_key] = False
+
+                        # Initialize Remove column based on select-all state
+                        class_df['Remove'] = st.session_state[select_all_key]
 
                         # Allow manual override
                         st.markdown("**Classification Results** (editable):")
@@ -1709,6 +1725,25 @@ def main():
                         categories = ['Revenue', 'COGS', 'Operating Expense', 'Interest', 'Income Tax', 'Non Operating Expense', 'Total', 'Skip', '']
                         numeric_cols = [col for col in class_df.columns if col not in [account_column, 'Label', 'Confidence', 'Remove']]
                         display_cols = [account_column] + numeric_cols + ['Label', 'Confidence', 'Remove']
+
+                        # Select All / Deselect All buttons
+                        sel_col1, sel_col2, sel_col3 = st.columns([1, 1, 2])
+                        with sel_col1:
+                            if st.button("☑️ Select All", key=f"select_all_btn_{json_idx}", use_container_width=True):
+                                st.session_state[select_all_key] = True
+                                # Clear editor state to force refresh with new defaults
+                                if editor_key in st.session_state:
+                                    del st.session_state[editor_key]
+                                st.rerun()
+                        with sel_col2:
+                            if st.button("☐ Deselect All", key=f"deselect_all_btn_{json_idx}", use_container_width=True):
+                                st.session_state[select_all_key] = False
+                                # Clear editor state to force refresh with new defaults
+                                if editor_key in st.session_state:
+                                    del st.session_state[editor_key]
+                                st.rerun()
+                        with sel_col3:
+                            st.caption("Tip: Select All, then uncheck rows you want to keep")
 
                         # Calculate table height based on row count (with min/max bounds)
                         num_rows = len(class_df)
@@ -1777,9 +1812,10 @@ def main():
 
                                     st.session_state.is_classifications[file_name] = new_classifications
 
-                                    # Clear the editor state to reset Remove checkboxes
+                                    # Clear the editor state and select-all state to reset
                                     if editor_key in st.session_state:
                                         del st.session_state[editor_key]
+                                    st.session_state[select_all_key] = False
 
                                     st.success(f"✅ Removed {int(removed_count)} rows!")
                                     time.sleep(0.5)
