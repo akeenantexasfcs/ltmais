@@ -1687,12 +1687,10 @@ def main():
                     # Show classifications if available
                     if file_name in st.session_state.is_classifications:
                         classifications = st.session_state.is_classifications[file_name]
-                        
-                        # Initialize remove state in session_state if not exists
-                        remove_state_key = f"remove_state_{file_name}"
-                        if remove_state_key not in st.session_state:
-                            st.session_state[remove_state_key] = {}
-                   
+
+                        # Key for the data_editor - this is how Streamlit tracks edits
+                        editor_key = f"class_editor_{json_idx}"
+
                         # Create classification display DataFrame
                         class_df = df.copy()
                         class_df['Label'] = class_df.index.map(
@@ -1701,33 +1699,23 @@ def main():
                         class_df['Confidence'] = class_df.index.map(
                             lambda idx: f"{classifications.get(idx, {}).get('confidence', 0):.0%}"
                         )
-                        # Initialize Remove column from session state
-                        class_df['Remove'] = class_df.index.map(
-                            lambda idx: st.session_state[remove_state_key].get(idx, False)
-                        )
-                   
+                        # Initialize Remove column - all False by default
+                        # The data_editor will manage the actual state via its key
+                        class_df['Remove'] = False
+
                         # Allow manual override
                         st.markdown("**Classification Results** (editable):")
-                   
+
                         categories = ['Revenue', 'COGS', 'Operating Expense', 'Interest', 'Income Tax', 'Non Operating Expense', 'Total', 'Skip', '']
                         numeric_cols = [col for col in class_df.columns if col not in [account_column, 'Label', 'Confidence', 'Remove']]
                         display_cols = [account_column] + numeric_cols + ['Label', 'Confidence', 'Remove']
-                        
-                        # Add buttons for select all/deselect all for removal
-                        col_btn1, col_btn2, col_btn3 = st.columns(3)
-                        with col_btn1:
-                            if st.button("✅ Select All for Removal", key=f"select_all_remove_{json_idx}"):
-                                for idx in class_df.index:
-                                    st.session_state[remove_state_key][idx] = True
-                                st.rerun()
-                        with col_btn2:
-                            if st.button("❌ Deselect All for Removal", key=f"deselect_all_remove_{json_idx}"):
-                                st.session_state[remove_state_key] = {}
-                                st.rerun()
-                        with col_btn3:
-                            remove_count = sum(st.session_state[remove_state_key].values())
-                            st.metric("Selected", remove_count)
-                        
+
+                        # Calculate table height based on row count (with min/max bounds)
+                        num_rows = len(class_df)
+                        row_height = 35  # Approximate pixels per row
+                        header_height = 40
+                        table_height = min(max(header_height + (num_rows * row_height), 200), 600)
+
                         edited_class_df = st.data_editor(
                             class_df[display_cols],
                             column_config={
@@ -1738,7 +1726,7 @@ def main():
                                 ),
                                 'Remove': st.column_config.CheckboxColumn(
                                     'Remove',
-                                    help="Select to remove this row",
+                                    help="Select rows to remove, then click the Remove button below",
                                     default=False
                                 ),
                                 'Confidence': st.column_config.TextColumn(
@@ -1749,52 +1737,66 @@ def main():
                             disabled=[account_column, 'Confidence'] + numeric_cols,
                             hide_index=True,
                             use_container_width=True,
-                            key=f"class_editor_{json_idx}"
+                            height=table_height,
+                            key=editor_key
                         )
-                   
-                        # Update classifications and remove state based on edits
-                        for idx, row in edited_class_df.iterrows():
-                            # Update remove state
-                            st.session_state[remove_state_key][idx] = row.get('Remove', False)
-                            
-                            # Update classification
-                            if idx in classifications:
-                                new_label = row['Label']
-                                # Only update if label actually changed
-                                if classifications[idx]['category'] != new_label:
-                                    classifications[idx]['category'] = new_label
-                   
-                        st.session_state.is_classifications[file_name] = classifications
-                        # Add remove button
-                        removed_count = sum(st.session_state[remove_state_key].values())
+
+                        # Count selected rows from the edited DataFrame (not from separate state)
+                        removed_count = edited_class_df['Remove'].sum() if 'Remove' in edited_class_df.columns else 0
+
+                        # Show selection count and action buttons
+                        col_btn1, col_btn2 = st.columns([3, 1])
+                        with col_btn2:
+                            st.metric("Selected", int(removed_count))
+
+                        # Add remove button - only process changes when clicked
                         if removed_count > 0:
-                            st.divider()
-                            if st.button(f"🗑️ Remove {removed_count} Selected Rows", key=f"remove_rows_{json_idx}", type="primary"):
-                                # Get indices to remove
-                                indices_to_remove = [idx for idx, remove in st.session_state[remove_state_key].items() if remove]
-                                
-                                # Filter out removed rows
-                                kept_df = df.drop(indices_to_remove).reset_index(drop=True)
-                                
-                                # Update the DataFrame in session state
-                                st.session_state.is_edited_table[file_name] = kept_df
-                                
-                                # Update classifications with new indices
-                                new_classifications = {}
-                                for new_idx, (old_idx, row) in enumerate(df.iterrows()):
-                                    if old_idx not in indices_to_remove and old_idx in classifications:
-                                        new_classifications[new_idx] = classifications[old_idx]
-                                
-                                st.session_state.is_classifications[file_name] = new_classifications
-                                
-                                # Clear remove state for this file
-                                st.session_state[remove_state_key] = {}
-                                
-                                st.success(f"✅ Removed {removed_count} rows!")
-                                time.sleep(0.5)
-                                st.rerun()
+                            with col_btn1:
+                                if st.button(f"🗑️ Remove {int(removed_count)} Selected Rows", key=f"remove_rows_{json_idx}", type="primary"):
+                                    # Get indices to remove from the edited DataFrame
+                                    indices_to_remove = edited_class_df[edited_class_df['Remove'] == True].index.tolist()
+
+                                    # Update classifications based on Label edits before removing
+                                    for idx, row in edited_class_df.iterrows():
+                                        if idx in classifications:
+                                            new_label = row['Label']
+                                            if classifications[idx]['category'] != new_label:
+                                                classifications[idx]['category'] = new_label
+
+                                    # Filter out removed rows
+                                    kept_df = df.drop(indices_to_remove).reset_index(drop=True)
+
+                                    # Update the DataFrame in session state
+                                    st.session_state.is_edited_table[file_name] = kept_df
+
+                                    # Update classifications with new indices
+                                    new_classifications = {}
+                                    for new_idx, (old_idx, row) in enumerate(df.iterrows()):
+                                        if old_idx not in indices_to_remove and old_idx in classifications:
+                                            new_classifications[new_idx] = classifications[old_idx]
+
+                                    st.session_state.is_classifications[file_name] = new_classifications
+
+                                    # Clear the editor state to reset Remove checkboxes
+                                    if editor_key in st.session_state:
+                                        del st.session_state[editor_key]
+
+                                    st.success(f"✅ Removed {int(removed_count)} rows!")
+                                    time.sleep(0.5)
+                                    st.rerun()
                         else:
-                            st.info("ℹ️ No rows selected for removal")
+                            with col_btn1:
+                                st.info("ℹ️ Select rows using the Remove checkbox, then click Remove")
+
+                        # Save Label edits to classifications (without triggering rerun)
+                        # Only check for changes, don't iterate on every render
+                        if editor_key in st.session_state and st.session_state[editor_key].get('edited_rows'):
+                            edited_rows = st.session_state[editor_key]['edited_rows']
+                            for row_idx_str, changes in edited_rows.items():
+                                row_idx = int(row_idx_str)
+                                if 'Label' in changes and row_idx in classifications:
+                                    classifications[row_idx]['category'] = changes['Label']
+                            st.session_state.is_classifications[file_name] = classifications
                
                     st.divider()
                
