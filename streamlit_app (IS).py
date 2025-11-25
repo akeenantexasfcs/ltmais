@@ -284,14 +284,20 @@ if 'is_edited_table' not in st.session_state:
 # Add included columns state
 if 'is_included_columns' not in st.session_state:
     st.session_state.is_included_columns = {}
-@st.cache_data
-def get_stable_cache_key():
-    """Generate a stable cache key for the current session."""
-    return hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
-@st.cache_data(ttl=600)
-def load_dictionary_cached(cache_key):
-    """Load dictionary data with caching"""
-    session = get_active_session()
+# REMOVED: get_stable_cache_key() - it generated new hashes on every render,
+# defeating the purpose of caching. Cache keys should be deterministic.
+
+@st.cache_resource
+def get_snowflake_session():
+    """Cache the Snowflake session connection as a resource."""
+    return get_active_session()
+@st.cache_data(ttl=600, show_spinner=False)
+def load_dictionary_cached(cache_version=0):
+    """
+    Load dictionary data with caching.
+    cache_version: Increment to invalidate cache (e.g., after adding new entries)
+    """
+    session = get_snowflake_session()
     try:
         dict_data = session.sql("""
             SELECT ACCOUNT, LABEL, MNEMONIC, REFERENCE
@@ -320,9 +326,8 @@ def search_dictionary(dict_df, search_term, cache_version):
         dict_df['MNEMONIC'].str.contains(search_term, case=False, na=False)
     )
     return dict_df[mask].copy()
-@st.cache_data
 def clean_numeric_value(value):
-    """Clean and convert numeric values to float."""
+    """Clean and convert a single numeric value to float (for backward compatibility)."""
     try:
         if pd.isna(value) or value == '' or value is None:
             return 0.0
@@ -331,32 +336,67 @@ def clean_numeric_value(value):
         value_str = str(value).strip()
         if value_str in ['-', '—', '–', '0', '0.0', '0.00']:
             return 0.0
-        # Fast negative check
-        is_negative = value_str.endswith('-') or value_str.startswith('(') or '(' in value_str
-        # Remove trailing minus
+        is_negative = value_str.endswith('-') or '(' in value_str
         if value_str.endswith('-'):
             value_str = value_str[:-1]
-        # Handle parentheses
         if '(' in value_str and ')' in value_str:
             is_negative = True
             value_str = value_str.replace('$(', '').replace('(', '').replace(')', '')
-        # Remove currency and commas
         cleaned_value = value_str.replace('$', '').replace(',', '')
         result = float(cleaned_value)
         return -result if is_negative else result
     except:
         return 0.0
-@st.cache_data
+
+def clean_numeric_series(series):
+    """
+    Vectorized numeric cleaning - processes entire Series at once.
+    Much faster than applying clean_numeric_value to each cell.
+    """
+    # Convert to string series for vectorized operations
+    str_series = series.astype(str).str.strip()
+
+    # Replace common zero/null representations
+    str_series = str_series.replace(['', 'nan', 'None', '-', '—', '–', 'NaN'], '0')
+
+    # Detect negative values (parentheses or trailing minus)
+    is_negative = str_series.str.contains(r'\(.*\)', regex=True) | str_series.str.endswith('-')
+
+    # Remove parentheses, currency symbols, commas, trailing minus
+    cleaned = (str_series
+               .str.replace(r'[\$,()]', '', regex=True)
+               .str.replace(r'-$', '', regex=True))  # trailing minus
+
+    # Convert to numeric
+    result = pd.to_numeric(cleaned, errors='coerce').fillna(0.0)
+
+    # Apply negative sign where needed
+    result = result.where(~is_negative, -result.abs())
+
+    return result
+
+def clean_numeric_columns(df, numeric_cols):
+    """
+    Apply vectorized cleaning to multiple columns at once.
+    Returns DataFrame with cleaned numeric columns.
+    """
+    df = df.copy()
+    for col in numeric_cols:
+        df[col] = clean_numeric_series(df[col])
+    return df
+@st.cache_data(show_spinner=False)
 def aggregate_data(df):
-    """Optimized data aggregation with vectorized operations"""
+    """Optimized data aggregation with fully vectorized operations"""
     df = df.copy()
     # Vectorized string operations
     df['Label'] = df['Label'].astype(str).str.strip()
     df['Account'] = df['Account'].astype(str).str.strip()
     numeric_cols = [col for col in df.columns if col not in ['Label', 'Account']]
-    # Vectorized numeric conversion
+
+    # OPTIMIZED: Use vectorized clean_numeric_series instead of cell-by-cell apply
     for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col].apply(clean_numeric_value), errors='coerce').fillna(0)
+        df[col] = clean_numeric_series(df[col])
+
     # Efficient groupby
     aggregated = df.groupby(['Label', 'Account'], as_index=False)[numeric_cols].sum()
     # Vectorized rounding
@@ -420,9 +460,13 @@ def extract_tables_from_textract(data):
                 table_df = table_df.sort_index(axis=1)
                 tables.append(table_df)
     return tables
-@st.cache_data(ttl=3600)
-def classify_income_statement_with_ai_cached(accounts_json, model, label_list):
-    """Cached version of AI classification to avoid repeated API calls"""
+@st.cache_data(ttl=86400, show_spinner=False)
+def classify_income_statement_with_ai_cached(accounts_hash, accounts_json, model):
+    """
+    Cached version of AI classification to avoid repeated API calls.
+    Uses hash-based cache key for stability (24-hour TTL).
+    The accounts_hash parameter ensures cache hits for identical account lists.
+    """
     session = get_active_session()
     prompt = f"""You are a financial analyst expert in income statement classification.
 Classify each line item into one of these primary categories:
@@ -472,6 +516,7 @@ Return ONLY the JSON array, no other text."""
                 return None
     except Exception:
         return None
+
 def classify_income_statement_with_ai(df, account_column, model, session):
     """AI classification with caching"""
     classifications = {}
@@ -485,8 +530,15 @@ def classify_income_statement_with_ai(df, account_column, model, session):
             })
     if not accounts_list:
         return classifications
-    accounts_json = json.dumps([acc['account'] for acc in accounts_list])
-    ai_results = classify_income_statement_with_ai_cached(accounts_json, model, tuple(accounts_list))
+
+    # Create stable cache key using hash of account names (not indices)
+    account_names = [acc['account'] for acc in accounts_list]
+    accounts_json = json.dumps(account_names)
+    accounts_hash = hashlib.md5(f"{accounts_json}:{model}".encode()).hexdigest()
+
+    # Call cached function with hash-based key
+    ai_results = classify_income_statement_with_ai_cached(accounts_hash, accounts_json, model)
+
     if ai_results:
         for i, account_data in enumerate(accounts_list):
             if i < len(ai_results):
@@ -585,8 +637,8 @@ SELECT SNOWFLAKE.CORTEX.COMPLETE(
     except Exception as e:
         st.error(f"Error getting signage recommendations: {str(e)}")
     return recommendations
-@st.cache_data(ttl=300) # Cache for 5 minutes
-def get_all_matches(account_name, label, dictionary_df, cache_key, run_llm=False, model='llama3.1-70b', fuzzy_threshold=70):
+@st.cache_data(ttl=300, show_spinner=False)
+def get_all_matches(account_name, label, dictionary_df, cache_version=0, run_llm=False, model='llama3.1-70b', fuzzy_threshold=70):
     """Optimized matching with parallel processing for LLM calls"""
     results = {
         'fuzzy': None,
@@ -860,8 +912,9 @@ def preview_pdf_pages(file):
         return None
 # Main app
 def main():
-    # Get Snowflake session
-    session = get_active_session()
+    # Get cached Snowflake session (avoids reconnecting on every rerun)
+    session = get_snowflake_session()
+
     # AI Models
     MODELS = [
         "llama3.1-405b",
@@ -871,8 +924,8 @@ def main():
         "claude-3-7-sonnet",
         "claude-4-sonnet"
     ]
-    # Get stable cache key
-    cache_key = get_stable_cache_key()
+
+    # Use dict_cache_version for cache invalidation instead of dynamic cache_key
     # Sidebar navigation
     with st.sidebar:
         st.markdown("## 📈 LTMA Suite")
@@ -1473,6 +1526,10 @@ def main():
                                     'source': 'pushed',
                                     'timestamp': file_data['timestamp']
                                 }
+
+                            # OPTIMIZATION: Clear memory-heavy PDF preview images after pushing
+                            st.session_state.pdf_pages = {}
+
                             st.session_state.app_mode = 'main'
                             st.success(f"✅ Pushed {len(st.session_state.processed_files)} JSON(s) to Income Statement Workflow!")
                             time.sleep(1)
@@ -1687,12 +1744,30 @@ def main():
                     # Show classifications if available
                     if file_name in st.session_state.is_classifications:
                         classifications = st.session_state.is_classifications[file_name]
-                        
-                        # Initialize remove state in session_state if not exists
-                        remove_state_key = f"remove_state_{file_name}"
-                        if remove_state_key not in st.session_state:
-                            st.session_state[remove_state_key] = {}
-                   
+
+                        # Key for the data_editor - this is how Streamlit tracks edits
+                        editor_key = f"class_editor_{json_idx}"
+                        select_all_key = f"select_all_{file_name}"
+
+                        # Initialize select-all state if not exists
+                        if select_all_key not in st.session_state:
+                            st.session_state[select_all_key] = False
+
+                        # Callback functions for Select All / Deselect All
+                        # Using callbacks ensures state changes happen BEFORE the rerun,
+                        # so no explicit st.rerun() is needed and scroll position is preserved
+                        def on_select_all(editor_key=editor_key, select_all_key=select_all_key):
+                            st.session_state[select_all_key] = True
+                            # Clear editor state to force refresh with new defaults
+                            if editor_key in st.session_state:
+                                del st.session_state[editor_key]
+
+                        def on_deselect_all(editor_key=editor_key, select_all_key=select_all_key):
+                            st.session_state[select_all_key] = False
+                            # Clear editor state to force refresh with new defaults
+                            if editor_key in st.session_state:
+                                del st.session_state[editor_key]
+
                         # Create classification display DataFrame
                         class_df = df.copy()
                         class_df['Label'] = class_df.index.map(
@@ -1701,33 +1776,34 @@ def main():
                         class_df['Confidence'] = class_df.index.map(
                             lambda idx: f"{classifications.get(idx, {}).get('confidence', 0):.0%}"
                         )
-                        # Initialize Remove column from session state
-                        class_df['Remove'] = class_df.index.map(
-                            lambda idx: st.session_state[remove_state_key].get(idx, False)
-                        )
-                   
+
+                        # Initialize Remove column based on select-all state
+                        class_df['Remove'] = st.session_state[select_all_key]
+
                         # Allow manual override
                         st.markdown("**Classification Results** (editable):")
-                   
+
                         categories = ['Revenue', 'COGS', 'Operating Expense', 'Interest', 'Income Tax', 'Non Operating Expense', 'Total', 'Skip', '']
                         numeric_cols = [col for col in class_df.columns if col not in [account_column, 'Label', 'Confidence', 'Remove']]
                         display_cols = [account_column] + numeric_cols + ['Label', 'Confidence', 'Remove']
-                        
-                        # Add buttons for select all/deselect all for removal
-                        col_btn1, col_btn2, col_btn3 = st.columns(3)
-                        with col_btn1:
-                            if st.button("✅ Select All for Removal", key=f"select_all_remove_{json_idx}"):
-                                for idx in class_df.index:
-                                    st.session_state[remove_state_key][idx] = True
-                                st.rerun()
-                        with col_btn2:
-                            if st.button("❌ Deselect All for Removal", key=f"deselect_all_remove_{json_idx}"):
-                                st.session_state[remove_state_key] = {}
-                                st.rerun()
-                        with col_btn3:
-                            remove_count = sum(st.session_state[remove_state_key].values())
-                            st.metric("Selected", remove_count)
-                        
+
+                        # Select All / Deselect All buttons with callbacks (no st.rerun needed)
+                        sel_col1, sel_col2, sel_col3 = st.columns([1, 1, 2])
+                        with sel_col1:
+                            st.button("☑️ Select All", key=f"select_all_btn_{json_idx}",
+                                     use_container_width=True, on_click=on_select_all)
+                        with sel_col2:
+                            st.button("☐ Deselect All", key=f"deselect_all_btn_{json_idx}",
+                                     use_container_width=True, on_click=on_deselect_all)
+                        with sel_col3:
+                            st.caption("Tip: Select All, then uncheck rows you want to keep")
+
+                        # Calculate table height based on row count (with min/max bounds)
+                        num_rows = len(class_df)
+                        row_height = 35  # Approximate pixels per row
+                        header_height = 40
+                        table_height = min(max(header_height + (num_rows * row_height), 200), 600)
+
                         edited_class_df = st.data_editor(
                             class_df[display_cols],
                             column_config={
@@ -1738,7 +1814,7 @@ def main():
                                 ),
                                 'Remove': st.column_config.CheckboxColumn(
                                     'Remove',
-                                    help="Select to remove this row",
+                                    help="Select rows to remove, then click the Remove button below",
                                     default=False
                                 ),
                                 'Confidence': st.column_config.TextColumn(
@@ -1749,52 +1825,67 @@ def main():
                             disabled=[account_column, 'Confidence'] + numeric_cols,
                             hide_index=True,
                             use_container_width=True,
-                            key=f"class_editor_{json_idx}"
+                            height=table_height,
+                            key=editor_key
                         )
-                   
-                        # Update classifications and remove state based on edits
-                        for idx, row in edited_class_df.iterrows():
-                            # Update remove state
-                            st.session_state[remove_state_key][idx] = row.get('Remove', False)
-                            
-                            # Update classification
-                            if idx in classifications:
-                                new_label = row['Label']
-                                # Only update if label actually changed
-                                if classifications[idx]['category'] != new_label:
-                                    classifications[idx]['category'] = new_label
-                   
-                        st.session_state.is_classifications[file_name] = classifications
-                        # Add remove button
-                        removed_count = sum(st.session_state[remove_state_key].values())
+
+                        # Count selected rows from the edited DataFrame (not from separate state)
+                        removed_count = edited_class_df['Remove'].sum() if 'Remove' in edited_class_df.columns else 0
+
+                        # Show selection count and action buttons
+                        col_btn1, col_btn2 = st.columns([3, 1])
+                        with col_btn2:
+                            st.metric("Selected", int(removed_count))
+
+                        # Add remove button - only process changes when clicked
                         if removed_count > 0:
-                            st.divider()
-                            if st.button(f"🗑️ Remove {removed_count} Selected Rows", key=f"remove_rows_{json_idx}", type="primary"):
-                                # Get indices to remove
-                                indices_to_remove = [idx for idx, remove in st.session_state[remove_state_key].items() if remove]
-                                
-                                # Filter out removed rows
-                                kept_df = df.drop(indices_to_remove).reset_index(drop=True)
-                                
-                                # Update the DataFrame in session state
-                                st.session_state.is_edited_table[file_name] = kept_df
-                                
-                                # Update classifications with new indices
-                                new_classifications = {}
-                                for new_idx, (old_idx, row) in enumerate(df.iterrows()):
-                                    if old_idx not in indices_to_remove and old_idx in classifications:
-                                        new_classifications[new_idx] = classifications[old_idx]
-                                
-                                st.session_state.is_classifications[file_name] = new_classifications
-                                
-                                # Clear remove state for this file
-                                st.session_state[remove_state_key] = {}
-                                
-                                st.success(f"✅ Removed {removed_count} rows!")
-                                time.sleep(0.5)
-                                st.rerun()
+                            with col_btn1:
+                                if st.button(f"🗑️ Remove {int(removed_count)} Selected Rows", key=f"remove_rows_{json_idx}", type="primary"):
+                                    # Get indices to remove from the edited DataFrame
+                                    indices_to_remove = edited_class_df[edited_class_df['Remove'] == True].index.tolist()
+
+                                    # Update classifications based on Label edits before removing
+                                    for idx, row in edited_class_df.iterrows():
+                                        if idx in classifications:
+                                            new_label = row['Label']
+                                            if classifications[idx]['category'] != new_label:
+                                                classifications[idx]['category'] = new_label
+
+                                    # Filter out removed rows
+                                    kept_df = df.drop(indices_to_remove).reset_index(drop=True)
+
+                                    # Update the DataFrame in session state
+                                    st.session_state.is_edited_table[file_name] = kept_df
+
+                                    # Update classifications with new indices
+                                    new_classifications = {}
+                                    for new_idx, (old_idx, row) in enumerate(df.iterrows()):
+                                        if old_idx not in indices_to_remove and old_idx in classifications:
+                                            new_classifications[new_idx] = classifications[old_idx]
+
+                                    st.session_state.is_classifications[file_name] = new_classifications
+
+                                    # Clear the editor state and select-all state to reset
+                                    if editor_key in st.session_state:
+                                        del st.session_state[editor_key]
+                                    st.session_state[select_all_key] = False
+
+                                    st.success(f"✅ Removed {int(removed_count)} rows!")
+                                    time.sleep(0.5)
+                                    st.rerun()
                         else:
-                            st.info("ℹ️ No rows selected for removal")
+                            with col_btn1:
+                                st.info("ℹ️ Select rows using the Remove checkbox, then click Remove")
+
+                        # Save Label edits to classifications (without triggering rerun)
+                        # Only check for changes, don't iterate on every render
+                        if editor_key in st.session_state and st.session_state[editor_key].get('edited_rows'):
+                            edited_rows = st.session_state[editor_key]['edited_rows']
+                            for row_idx_str, changes in edited_rows.items():
+                                row_idx = int(row_idx_str)
+                                if 'Label' in changes and row_idx in classifications:
+                                    classifications[row_idx]['category'] = changes['Label']
+                            st.session_state.is_classifications[file_name] = classifications
                
                     st.divider()
                
@@ -2002,7 +2093,7 @@ def main():
                                 else:
                                     st.session_state.is_ready_for_aggregation.add(file_name)
                                     st.success("✅ Marked as ready for aggregation step!")
-                                st.rerun()
+                                # REMOVED: st.rerun() - Streamlit naturally reruns after button click
                    
                         # Show full results if toggled
                         if st.session_state.get(f"show_full_{file_name}", False):
@@ -2041,7 +2132,7 @@ def main():
                     with col2:
                         if st.button("❌ Unmark", key=f"unmark_{ready_file}_{idx}", use_container_width=True):
                             st.session_state.is_ready_for_aggregation.discard(ready_file)
-                            st.rerun()
+                            # REMOVED: st.rerun() - Streamlit naturally reruns after button click
        
             # Continue to aggregation button
             if ready_count > 0:
@@ -2072,7 +2163,7 @@ def main():
                     if st.button("✓ Dismiss Message", key="dismiss_removed_rows"):
                         st.session_state.show_removed_rows_message = False
                         st.session_state.removed_zero_rows = []
-                        st.rerun()
+                        # REMOVED: st.rerun() - Streamlit naturally reruns after button click
                 st.divider()
            
             if st.session_state.is_aggregated_data is not None:
@@ -2110,12 +2201,16 @@ def main():
                 with col2:
                     if st.button("➡️ Proceed to Mapping", type="primary", key="proceed_to_mapping_btn"):
                         with st.spinner("Analyzing signage conventions..."):
-                            df_hash = get_stable_cache_key()
+                            # Create deterministic hash from actual data content
+                            agg_data = st.session_state.is_aggregated_data
+                            df_hash = hashlib.md5(
+                                f"{len(agg_data)}:{agg_data['Account'].tolist()}".encode()
+                            ).hexdigest()[:12]
                             st.session_state.is_signage_recommendations = recommend_signage_with_ai(
-                                df_hash, st.session_state.is_aggregated_data[['Account', 'Label']], 'llama3.1-70b', df_hash
+                                df_hash, agg_data[['Account', 'Label']], 'llama3.1-70b', df_hash
                             )
                         st.session_state.show_mapping = True
-                        st.rerun()
+                        # REMOVED: st.rerun() - Streamlit naturally updates after button click
        
             if st.session_state.show_mapping:
                 st.markdown('<div class="section-header"><h3>🔗 Map to Standard Mnemonics</h3></div>', unsafe_allow_html=True)
@@ -2128,7 +2223,7 @@ def main():
                     if st.button("Clear message", key="clear_mapping_message"):
                         st.session_state.show_success_message = False
                         st.session_state.just_added_mappings = []
-                        st.rerun()
+                        # REMOVED: st.rerun() - Streamlit naturally reruns after button click
                 st.markdown("#### 📋 Workflow")
                 workflow_cols = st.columns(4)
                 with workflow_cols[0]:
@@ -2142,9 +2237,9 @@ def main():
                 if st.session_state.is_aggregated_data is None:
                     st.info("👈 Please aggregate data first in the Aggregate Data tab")
                     return
-                # Load dictionary with caching
+                # Load dictionary with caching (use cache_version for invalidation)
                 if st.session_state.is_dictionary_data is None:
-                    dict_data = load_dictionary_cached(cache_key)
+                    dict_data = load_dictionary_cached(st.session_state.dict_cache_version)
                     if dict_data is not None:
                         st.session_state.is_dictionary_data = dict_data
                 # Company info
@@ -2177,7 +2272,7 @@ def main():
                                 row['Account'],
                                 row['Label'],
                                 st.session_state.is_dictionary_data,
-                                cache_key,
+                                st.session_state.dict_cache_version,
                                 run_llm=run_llm,
                                 model=ai_model if run_llm else None,
                                 fuzzy_threshold=70
@@ -2669,9 +2764,10 @@ def main():
                                                 except Exception as e:
                                                     st.warning(f"Failed to add {mapping['ACCOUNT']}: {str(e)}")
                                             if success_count > 0:
-                                                # Clear cache and reload
+                                                # Increment cache version and reload
+                                                st.session_state.dict_cache_version += 1
                                                 load_dictionary_cached.clear()
-                                                dict_df = load_dictionary_cached(cache_key)
+                                                dict_df = load_dictionary_cached(st.session_state.dict_cache_version)
                                                 st.session_state.is_dictionary_data = dict_df
                                                 st.session_state.just_added_mappings = added_mappings
                                                 st.session_state.show_success_message = True
