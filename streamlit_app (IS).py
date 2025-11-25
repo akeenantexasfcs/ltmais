@@ -227,6 +227,10 @@ if 'is_json_files' not in st.session_state:
     st.session_state.is_json_files = {} # Stores all JSONs (uploaded or pushed)
 if 'is_classifications' not in st.session_state:
     st.session_state.is_classifications = {} # Stores classification results
+if 'is_original_classifications' not in st.session_state:
+    st.session_state.is_original_classifications = {} # Stores ORIGINAL AI classifications (for reset)
+if 'is_original_table' not in st.session_state:
+    st.session_state.is_original_table = {} # Stores original DataFrame before edits (for reset)
 if 'is_column_names' not in st.session_state:
     st.session_state.is_column_names = {} # Stores column names for each JSON
 if 'is_selected_tables' not in st.session_state:
@@ -1734,13 +1738,50 @@ def main():
                
                     # ===== STEP 2: Classify Accounts =====
                     st.markdown("#### 🏷️ Step 2: Classify Accounts")
-               
-                    if st.button(f"🤖 Classify with AI", key=f"classify_{json_idx}"):
-                        with st.spinner("Classifying accounts with AI..."):
-                            classifications = classify_income_statement_with_ai(df, account_column, model, session)
-                            st.session_state.is_classifications[file_name] = classifications
-                            st.success(f"✅ Classified {len(classifications)} accounts!")
-               
+
+                    # Callback for Reset to Original button
+                    def on_reset_to_original(file_name=file_name, editor_key=f"class_editor_{json_idx}",
+                                            select_all_key=f"select_all_{file_name}"):
+                        """Reset classifications and table to original AI-generated state."""
+                        import copy
+                        if file_name in st.session_state.is_original_classifications:
+                            st.session_state.is_classifications[file_name] = copy.deepcopy(
+                                st.session_state.is_original_classifications[file_name]
+                            )
+                        if file_name in st.session_state.is_original_table:
+                            st.session_state.is_edited_table[file_name] = st.session_state.is_original_table[file_name].copy()
+                        # Clear editor state to force refresh
+                        if editor_key in st.session_state:
+                            del st.session_state[editor_key]
+                        # Reset select-all state
+                        st.session_state[select_all_key] = False
+
+                    # Button row: Classify with AI + Reset to Original
+                    classify_col1, classify_col2 = st.columns([1, 1])
+                    with classify_col1:
+                        if st.button(f"🤖 Classify with AI", key=f"classify_{json_idx}"):
+                            with st.spinner("Classifying accounts with AI..."):
+                                import copy
+                                classifications = classify_income_statement_with_ai(df, account_column, model, session)
+                                st.session_state.is_classifications[file_name] = classifications
+                                # Store ORIGINAL classifications for reset functionality
+                                st.session_state.is_original_classifications[file_name] = copy.deepcopy(classifications)
+                                # Store ORIGINAL table for reset functionality
+                                st.session_state.is_original_table[file_name] = df.copy()
+                                st.success(f"✅ Classified {len(classifications)} accounts!")
+
+                    with classify_col2:
+                        # Only show Reset button if original classifications exist
+                        if file_name in st.session_state.is_original_classifications:
+                            st.button("🔄 Reset to Original", key=f"reset_{json_idx}",
+                                     on_click=on_reset_to_original,
+                                     help="Restore original AI classifications and undo all edits")
+
+                    # Show reset success message if applicable
+                    if f"reset_success_{file_name}" in st.session_state and st.session_state[f"reset_success_{file_name}"]:
+                        st.success("✅ Classifications reset to original AI results!")
+                        st.session_state[f"reset_success_{file_name}"] = False
+
                     # Show classifications if available
                     if file_name in st.session_state.is_classifications:
                         classifications = st.session_state.is_classifications[file_name]
@@ -1857,10 +1898,12 @@ def main():
                                     # Update the DataFrame in session state
                                     st.session_state.is_edited_table[file_name] = kept_df
 
-                                    # Update classifications with new indices
+                                    # FIX: Properly rebuild classifications with correct new indices
+                                    # Only increment new_idx for rows we're KEEPING, not all rows
                                     new_classifications = {}
-                                    for new_idx, (old_idx, row) in enumerate(df.iterrows()):
-                                        if old_idx not in indices_to_remove and old_idx in classifications:
+                                    kept_indices = [idx for idx in df.index if idx not in indices_to_remove]
+                                    for new_idx, old_idx in enumerate(kept_indices):
+                                        if old_idx in classifications:
                                             new_classifications[new_idx] = classifications[old_idx]
 
                                     st.session_state.is_classifications[file_name] = new_classifications
@@ -2011,16 +2054,22 @@ def main():
                         final_df['Label'] = final_df.index.map(
                             lambda idx: st.session_state.is_classifications[file_name].get(idx, {}).get('category', 'Unclassified')
                         )
-                   
-                        # Rename columns
-                        col_rename = {account_column: 'Account'}
-                        included_numeric_cols = [col for col in numeric_cols if st.session_state.is_included_columns[file_name].get(col, False)]
-                        col_rename.update({col: st.session_state.is_column_names[file_name][col] for col in included_numeric_cols})
-                        final_df = final_df.rename(columns=col_rename)
-                   
-                        # Drop excluded columns
-                        excluded_cols = [col for col in numeric_cols if not st.session_state.is_included_columns[file_name].get(col, False)]
+
+                        # Get the current numeric columns from the DataFrame (not from cached variable)
+                        current_numeric_cols = [c for c in final_df.columns if c not in [account_column, 'Label']]
+
+                        # FIX: Drop excluded columns FIRST (before renaming) using original column names
+                        excluded_cols = [col for col in current_numeric_cols
+                                        if not st.session_state.is_included_columns[file_name].get(col, True)]
                         final_df = final_df.drop(columns=excluded_cols, errors='ignore')
+
+                        # Now get included columns and rename them
+                        included_numeric_cols = [col for col in current_numeric_cols
+                                                if st.session_state.is_included_columns[file_name].get(col, True)]
+                        col_rename = {account_column: 'Account'}
+                        col_rename.update({col: st.session_state.is_column_names[file_name].get(col, col)
+                                          for col in included_numeric_cols})
+                        final_df = final_df.rename(columns=col_rename)
                    
                         # Reorder columns: Label, Account, then periods
                         cols_order = ['Label', 'Account'] + [c for c in final_df.columns if c not in ['Label', 'Account']]
@@ -2285,6 +2334,30 @@ def main():
                             })
                             progress.progress((idx + 1) / len(aggregated))
                         st.session_state.mapping_results = mapping_results
+
+                        # PRE-INITIALIZE user_selections to prevent first-selection jitter
+                        # This ensures all indices have defaults BEFORE the UI renders selectboxes
+                        for result in mapping_results:
+                            idx = result['index']
+                            matches = result['matches']
+
+                            # Determine default choice based on match quality
+                            if matches['fuzzy'] and matches['fuzzy']['score'] >= 80:
+                                default_choice = f"Fuzzy ({matches['fuzzy']['score']}%)"
+                            elif matches['llm'] and 'error' not in matches['llm']:
+                                default_choice = "AI Match"
+                            elif matches['fuzzy'] and matches['fuzzy']['score'] >= 70:
+                                default_choice = f"Fuzzy ({matches['fuzzy']['score']}%)"
+                            else:
+                                default_choice = "Select..."
+
+                            st.session_state.user_selections[idx] = {
+                                'choice': default_choice,
+                                'manual': None,
+                                'fuzzy': matches['fuzzy'],
+                                'llm': matches['llm']
+                            }
+
                         st.success("✅ Analysis complete! Review matches below.")
                 # Display results (rest of the mapping code remains the same)
                 if 'mapping_results' in st.session_state and st.session_state.mapping_results:
@@ -2622,12 +2695,18 @@ def main():
                                             index=default_choice,
                                             label_visibility="collapsed"
                                         )
-                                        st.session_state.user_selections[idx] = {
-                                            'choice': final_choice,
-                                            'manual': manual_selection if manual_selection != 'None' else None,
-                                            'fuzzy': matches['fuzzy'],
-                                            'llm': matches['llm']
-                                        }
+                                        # Only update session state if selection actually changed
+                                        # This prevents unnecessary state mutations that cause jitter
+                                        manual_value = manual_selection if manual_selection != 'None' else None
+                                        current_sel = st.session_state.user_selections.get(idx, {})
+                                        if (current_sel.get('choice') != final_choice or
+                                            current_sel.get('manual') != manual_value):
+                                            st.session_state.user_selections[idx] = {
+                                                'choice': final_choice,
+                                                'manual': manual_value,
+                                                'fuzzy': matches['fuzzy'],
+                                                'llm': matches['llm']
+                                            }
                                         # Signage section
                                         st.markdown("**📊 Signage Recommendation**")
                                         if idx in st.session_state.is_signage_recommendations:
@@ -2900,6 +2979,8 @@ def main():
             if st.button("🗑️ Clear All and Start Over", use_container_width=True):
                 st.session_state.is_json_files = {}
                 st.session_state.is_classifications = {}
+                st.session_state.is_original_classifications = {}  # Clear original classifications
+                st.session_state.is_original_table = {}  # Clear original tables
                 st.session_state.is_column_names = {}
                 st.session_state.is_selected_tables = {}
                 st.session_state.is_processed_data = {}
