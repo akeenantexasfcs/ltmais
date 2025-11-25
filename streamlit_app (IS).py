@@ -1747,6 +1747,26 @@ def main():
 
                         # Key for the data_editor - this is how Streamlit tracks edits
                         editor_key = f"class_editor_{json_idx}"
+                        select_all_key = f"select_all_{file_name}"
+
+                        # Initialize select-all state if not exists
+                        if select_all_key not in st.session_state:
+                            st.session_state[select_all_key] = False
+
+                        # Callback functions for Select All / Deselect All
+                        # Using callbacks ensures state changes happen BEFORE the rerun,
+                        # so no explicit st.rerun() is needed and scroll position is preserved
+                        def on_select_all(editor_key=editor_key, select_all_key=select_all_key):
+                            st.session_state[select_all_key] = True
+                            # Clear editor state to force refresh with new defaults
+                            if editor_key in st.session_state:
+                                del st.session_state[editor_key]
+
+                        def on_deselect_all(editor_key=editor_key, select_all_key=select_all_key):
+                            st.session_state[select_all_key] = False
+                            # Clear editor state to force refresh with new defaults
+                            if editor_key in st.session_state:
+                                del st.session_state[editor_key]
 
                         # Create classification display DataFrame
                         class_df = df.copy()
@@ -1756,10 +1776,6 @@ def main():
                         class_df['Confidence'] = class_df.index.map(
                             lambda idx: f"{classifications.get(idx, {}).get('confidence', 0):.0%}"
                         )
-                        # Track select-all state for this file
-                        select_all_key = f"select_all_{file_name}"
-                        if select_all_key not in st.session_state:
-                            st.session_state[select_all_key] = False
 
                         # Initialize Remove column based on select-all state
                         class_df['Remove'] = st.session_state[select_all_key]
@@ -1771,22 +1787,14 @@ def main():
                         numeric_cols = [col for col in class_df.columns if col not in [account_column, 'Label', 'Confidence', 'Remove']]
                         display_cols = [account_column] + numeric_cols + ['Label', 'Confidence', 'Remove']
 
-                        # Select All / Deselect All buttons
+                        # Select All / Deselect All buttons with callbacks (no st.rerun needed)
                         sel_col1, sel_col2, sel_col3 = st.columns([1, 1, 2])
                         with sel_col1:
-                            if st.button("☑️ Select All", key=f"select_all_btn_{json_idx}", use_container_width=True):
-                                st.session_state[select_all_key] = True
-                                # Clear editor state to force refresh with new defaults
-                                if editor_key in st.session_state:
-                                    del st.session_state[editor_key]
-                                st.rerun()
+                            st.button("☑️ Select All", key=f"select_all_btn_{json_idx}",
+                                     use_container_width=True, on_click=on_select_all)
                         with sel_col2:
-                            if st.button("☐ Deselect All", key=f"deselect_all_btn_{json_idx}", use_container_width=True):
-                                st.session_state[select_all_key] = False
-                                # Clear editor state to force refresh with new defaults
-                                if editor_key in st.session_state:
-                                    del st.session_state[editor_key]
-                                st.rerun()
+                            st.button("☐ Deselect All", key=f"deselect_all_btn_{json_idx}",
+                                     use_container_width=True, on_click=on_deselect_all)
                         with sel_col3:
                             st.caption("Tip: Select All, then uncheck rows you want to keep")
 
