@@ -2334,6 +2334,30 @@ def main():
                             })
                             progress.progress((idx + 1) / len(aggregated))
                         st.session_state.mapping_results = mapping_results
+
+                        # PRE-INITIALIZE user_selections to prevent first-selection jitter
+                        # This ensures all indices have defaults BEFORE the UI renders selectboxes
+                        for result in mapping_results:
+                            idx = result['index']
+                            matches = result['matches']
+
+                            # Determine default choice based on match quality
+                            if matches['fuzzy'] and matches['fuzzy']['score'] >= 80:
+                                default_choice = f"Fuzzy ({matches['fuzzy']['score']}%)"
+                            elif matches['llm'] and 'error' not in matches['llm']:
+                                default_choice = "AI Match"
+                            elif matches['fuzzy'] and matches['fuzzy']['score'] >= 70:
+                                default_choice = f"Fuzzy ({matches['fuzzy']['score']}%)"
+                            else:
+                                default_choice = "Select..."
+
+                            st.session_state.user_selections[idx] = {
+                                'choice': default_choice,
+                                'manual': None,
+                                'fuzzy': matches['fuzzy'],
+                                'llm': matches['llm']
+                            }
+
                         st.success("✅ Analysis complete! Review matches below.")
                 # Display results (rest of the mapping code remains the same)
                 if 'mapping_results' in st.session_state and st.session_state.mapping_results:
@@ -2671,12 +2695,18 @@ def main():
                                             index=default_choice,
                                             label_visibility="collapsed"
                                         )
-                                        st.session_state.user_selections[idx] = {
-                                            'choice': final_choice,
-                                            'manual': manual_selection if manual_selection != 'None' else None,
-                                            'fuzzy': matches['fuzzy'],
-                                            'llm': matches['llm']
-                                        }
+                                        # Only update session state if selection actually changed
+                                        # This prevents unnecessary state mutations that cause jitter
+                                        manual_value = manual_selection if manual_selection != 'None' else None
+                                        current_sel = st.session_state.user_selections.get(idx, {})
+                                        if (current_sel.get('choice') != final_choice or
+                                            current_sel.get('manual') != manual_value):
+                                            st.session_state.user_selections[idx] = {
+                                                'choice': final_choice,
+                                                'manual': manual_value,
+                                                'fuzzy': matches['fuzzy'],
+                                                'llm': matches['llm']
+                                            }
                                         # Signage section
                                         st.markdown("**📊 Signage Recommendation**")
                                         if idx in st.session_state.is_signage_recommendations:
