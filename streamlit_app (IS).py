@@ -1898,10 +1898,12 @@ def main():
                                     # Update the DataFrame in session state
                                     st.session_state.is_edited_table[file_name] = kept_df
 
-                                    # Update classifications with new indices
+                                    # FIX: Properly rebuild classifications with correct new indices
+                                    # Only increment new_idx for rows we're KEEPING, not all rows
                                     new_classifications = {}
-                                    for new_idx, (old_idx, row) in enumerate(df.iterrows()):
-                                        if old_idx not in indices_to_remove and old_idx in classifications:
+                                    kept_indices = [idx for idx in df.index if idx not in indices_to_remove]
+                                    for new_idx, old_idx in enumerate(kept_indices):
+                                        if old_idx in classifications:
                                             new_classifications[new_idx] = classifications[old_idx]
 
                                     st.session_state.is_classifications[file_name] = new_classifications
