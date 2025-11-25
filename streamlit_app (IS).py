@@ -284,14 +284,20 @@ if 'is_edited_table' not in st.session_state:
 # Add included columns state
 if 'is_included_columns' not in st.session_state:
     st.session_state.is_included_columns = {}
-@st.cache_data
-def get_stable_cache_key():
-    """Generate a stable cache key for the current session."""
-    return hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
-@st.cache_data(ttl=600)
-def load_dictionary_cached(cache_key):
-    """Load dictionary data with caching"""
-    session = get_active_session()
+# REMOVED: get_stable_cache_key() - it generated new hashes on every render,
+# defeating the purpose of caching. Cache keys should be deterministic.
+
+@st.cache_resource
+def get_snowflake_session():
+    """Cache the Snowflake session connection as a resource."""
+    return get_active_session()
+@st.cache_data(ttl=600, show_spinner=False)
+def load_dictionary_cached(cache_version=0):
+    """
+    Load dictionary data with caching.
+    cache_version: Increment to invalidate cache (e.g., after adding new entries)
+    """
+    session = get_snowflake_session()
     try:
         dict_data = session.sql("""
             SELECT ACCOUNT, LABEL, MNEMONIC, REFERENCE
@@ -320,9 +326,8 @@ def search_dictionary(dict_df, search_term, cache_version):
         dict_df['MNEMONIC'].str.contains(search_term, case=False, na=False)
     )
     return dict_df[mask].copy()
-@st.cache_data
 def clean_numeric_value(value):
-    """Clean and convert numeric values to float."""
+    """Clean and convert a single numeric value to float (for backward compatibility)."""
     try:
         if pd.isna(value) or value == '' or value is None:
             return 0.0
@@ -331,32 +336,67 @@ def clean_numeric_value(value):
         value_str = str(value).strip()
         if value_str in ['-', '—', '–', '0', '0.0', '0.00']:
             return 0.0
-        # Fast negative check
-        is_negative = value_str.endswith('-') or value_str.startswith('(') or '(' in value_str
-        # Remove trailing minus
+        is_negative = value_str.endswith('-') or '(' in value_str
         if value_str.endswith('-'):
             value_str = value_str[:-1]
-        # Handle parentheses
         if '(' in value_str and ')' in value_str:
             is_negative = True
             value_str = value_str.replace('$(', '').replace('(', '').replace(')', '')
-        # Remove currency and commas
         cleaned_value = value_str.replace('$', '').replace(',', '')
         result = float(cleaned_value)
         return -result if is_negative else result
     except:
         return 0.0
-@st.cache_data
+
+def clean_numeric_series(series):
+    """
+    Vectorized numeric cleaning - processes entire Series at once.
+    Much faster than applying clean_numeric_value to each cell.
+    """
+    # Convert to string series for vectorized operations
+    str_series = series.astype(str).str.strip()
+
+    # Replace common zero/null representations
+    str_series = str_series.replace(['', 'nan', 'None', '-', '—', '–', 'NaN'], '0')
+
+    # Detect negative values (parentheses or trailing minus)
+    is_negative = str_series.str.contains(r'\(.*\)', regex=True) | str_series.str.endswith('-')
+
+    # Remove parentheses, currency symbols, commas, trailing minus
+    cleaned = (str_series
+               .str.replace(r'[\$,()]', '', regex=True)
+               .str.replace(r'-$', '', regex=True))  # trailing minus
+
+    # Convert to numeric
+    result = pd.to_numeric(cleaned, errors='coerce').fillna(0.0)
+
+    # Apply negative sign where needed
+    result = result.where(~is_negative, -result.abs())
+
+    return result
+
+def clean_numeric_columns(df, numeric_cols):
+    """
+    Apply vectorized cleaning to multiple columns at once.
+    Returns DataFrame with cleaned numeric columns.
+    """
+    df = df.copy()
+    for col in numeric_cols:
+        df[col] = clean_numeric_series(df[col])
+    return df
+@st.cache_data(show_spinner=False)
 def aggregate_data(df):
-    """Optimized data aggregation with vectorized operations"""
+    """Optimized data aggregation with fully vectorized operations"""
     df = df.copy()
     # Vectorized string operations
     df['Label'] = df['Label'].astype(str).str.strip()
     df['Account'] = df['Account'].astype(str).str.strip()
     numeric_cols = [col for col in df.columns if col not in ['Label', 'Account']]
-    # Vectorized numeric conversion
+
+    # OPTIMIZED: Use vectorized clean_numeric_series instead of cell-by-cell apply
     for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col].apply(clean_numeric_value), errors='coerce').fillna(0)
+        df[col] = clean_numeric_series(df[col])
+
     # Efficient groupby
     aggregated = df.groupby(['Label', 'Account'], as_index=False)[numeric_cols].sum()
     # Vectorized rounding
@@ -597,8 +637,8 @@ SELECT SNOWFLAKE.CORTEX.COMPLETE(
     except Exception as e:
         st.error(f"Error getting signage recommendations: {str(e)}")
     return recommendations
-@st.cache_data(ttl=300) # Cache for 5 minutes
-def get_all_matches(account_name, label, dictionary_df, cache_key, run_llm=False, model='llama3.1-70b', fuzzy_threshold=70):
+@st.cache_data(ttl=300, show_spinner=False)
+def get_all_matches(account_name, label, dictionary_df, cache_version=0, run_llm=False, model='llama3.1-70b', fuzzy_threshold=70):
     """Optimized matching with parallel processing for LLM calls"""
     results = {
         'fuzzy': None,
@@ -872,8 +912,9 @@ def preview_pdf_pages(file):
         return None
 # Main app
 def main():
-    # Get Snowflake session
-    session = get_active_session()
+    # Get cached Snowflake session (avoids reconnecting on every rerun)
+    session = get_snowflake_session()
+
     # AI Models
     MODELS = [
         "llama3.1-405b",
@@ -883,8 +924,8 @@ def main():
         "claude-3-7-sonnet",
         "claude-4-sonnet"
     ]
-    # Get stable cache key
-    cache_key = get_stable_cache_key()
+
+    # Use dict_cache_version for cache invalidation instead of dynamic cache_key
     # Sidebar navigation
     with st.sidebar:
         st.markdown("## 📈 LTMA Suite")
@@ -1485,6 +1526,10 @@ def main():
                                     'source': 'pushed',
                                     'timestamp': file_data['timestamp']
                                 }
+
+                            # OPTIMIZATION: Clear memory-heavy PDF preview images after pushing
+                            st.session_state.pdf_pages = {}
+
                             st.session_state.app_mode = 'main'
                             st.success(f"✅ Pushed {len(st.session_state.processed_files)} JSON(s) to Income Statement Workflow!")
                             time.sleep(1)
@@ -2040,7 +2085,7 @@ def main():
                                 else:
                                     st.session_state.is_ready_for_aggregation.add(file_name)
                                     st.success("✅ Marked as ready for aggregation step!")
-                                st.rerun()
+                                # REMOVED: st.rerun() - Streamlit naturally reruns after button click
                    
                         # Show full results if toggled
                         if st.session_state.get(f"show_full_{file_name}", False):
@@ -2079,7 +2124,7 @@ def main():
                     with col2:
                         if st.button("❌ Unmark", key=f"unmark_{ready_file}_{idx}", use_container_width=True):
                             st.session_state.is_ready_for_aggregation.discard(ready_file)
-                            st.rerun()
+                            # REMOVED: st.rerun() - Streamlit naturally reruns after button click
        
             # Continue to aggregation button
             if ready_count > 0:
@@ -2110,7 +2155,7 @@ def main():
                     if st.button("✓ Dismiss Message", key="dismiss_removed_rows"):
                         st.session_state.show_removed_rows_message = False
                         st.session_state.removed_zero_rows = []
-                        st.rerun()
+                        # REMOVED: st.rerun() - Streamlit naturally reruns after button click
                 st.divider()
            
             if st.session_state.is_aggregated_data is not None:
@@ -2148,12 +2193,16 @@ def main():
                 with col2:
                     if st.button("➡️ Proceed to Mapping", type="primary", key="proceed_to_mapping_btn"):
                         with st.spinner("Analyzing signage conventions..."):
-                            df_hash = get_stable_cache_key()
+                            # Create deterministic hash from actual data content
+                            agg_data = st.session_state.is_aggregated_data
+                            df_hash = hashlib.md5(
+                                f"{len(agg_data)}:{agg_data['Account'].tolist()}".encode()
+                            ).hexdigest()[:12]
                             st.session_state.is_signage_recommendations = recommend_signage_with_ai(
-                                df_hash, st.session_state.is_aggregated_data[['Account', 'Label']], 'llama3.1-70b', df_hash
+                                df_hash, agg_data[['Account', 'Label']], 'llama3.1-70b', df_hash
                             )
                         st.session_state.show_mapping = True
-                        st.rerun()
+                        # REMOVED: st.rerun() - Streamlit naturally updates after button click
        
             if st.session_state.show_mapping:
                 st.markdown('<div class="section-header"><h3>🔗 Map to Standard Mnemonics</h3></div>', unsafe_allow_html=True)
@@ -2166,7 +2215,7 @@ def main():
                     if st.button("Clear message", key="clear_mapping_message"):
                         st.session_state.show_success_message = False
                         st.session_state.just_added_mappings = []
-                        st.rerun()
+                        # REMOVED: st.rerun() - Streamlit naturally reruns after button click
                 st.markdown("#### 📋 Workflow")
                 workflow_cols = st.columns(4)
                 with workflow_cols[0]:
@@ -2180,9 +2229,9 @@ def main():
                 if st.session_state.is_aggregated_data is None:
                     st.info("👈 Please aggregate data first in the Aggregate Data tab")
                     return
-                # Load dictionary with caching
+                # Load dictionary with caching (use cache_version for invalidation)
                 if st.session_state.is_dictionary_data is None:
-                    dict_data = load_dictionary_cached(cache_key)
+                    dict_data = load_dictionary_cached(st.session_state.dict_cache_version)
                     if dict_data is not None:
                         st.session_state.is_dictionary_data = dict_data
                 # Company info
@@ -2215,7 +2264,7 @@ def main():
                                 row['Account'],
                                 row['Label'],
                                 st.session_state.is_dictionary_data,
-                                cache_key,
+                                st.session_state.dict_cache_version,
                                 run_llm=run_llm,
                                 model=ai_model if run_llm else None,
                                 fuzzy_threshold=70
@@ -2707,9 +2756,10 @@ def main():
                                                 except Exception as e:
                                                     st.warning(f"Failed to add {mapping['ACCOUNT']}: {str(e)}")
                                             if success_count > 0:
-                                                # Clear cache and reload
+                                                # Increment cache version and reload
+                                                st.session_state.dict_cache_version += 1
                                                 load_dictionary_cached.clear()
-                                                dict_df = load_dictionary_cached(cache_key)
+                                                dict_df = load_dictionary_cached(st.session_state.dict_cache_version)
                                                 st.session_state.is_dictionary_data = dict_df
                                                 st.session_state.just_added_mappings = added_mappings
                                                 st.session_state.show_success_message = True
